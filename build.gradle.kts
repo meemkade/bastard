@@ -1,6 +1,6 @@
 plugins {
 	kotlin("jvm") version "2.2.21"
-	application // internal testing only
+	application
 }
 
 application {
@@ -9,7 +9,7 @@ application {
 }
 
 group = "org.bread_experts_group"
-version = "1.0.0"
+version = "1.1.0"
 
 repositories {
 	mavenCentral()
