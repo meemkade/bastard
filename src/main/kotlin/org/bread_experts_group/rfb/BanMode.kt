@@ -1,4 +1,4 @@
-package org.bread_experts_group.project_incubator.rfb
+package org.bread_experts_group.rfb
 
 enum class BanMode(val description: String) {
 	CLOSE("Immediately closes the connection after acceptance, attempting a graceful closure."),

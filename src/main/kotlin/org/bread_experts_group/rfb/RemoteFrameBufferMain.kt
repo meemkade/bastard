@@ -1,12 +1,6 @@
-package org.bread_experts_group.project_incubator.rfb
+package org.bread_experts_group.rfb
 
 import org.bread_experts_group.Flaggable.Companion.from
-import org.bread_experts_group.Flaggable.Companion.raw
-import org.bread_experts_group.MappedEnumeration
-import org.bread_experts_group.api.coding.CodingFormats
-import org.bread_experts_group.api.coding.CodingFormatsProvider
-import org.bread_experts_group.api.coding.png.PNGChunk
-import org.bread_experts_group.api.coding.png.StandardPNGReadingFeatures
 import org.bread_experts_group.api.system.SystemFeatures
 import org.bread_experts_group.api.system.SystemProvider
 import org.bread_experts_group.api.system.device.SystemDeviceFeatures
@@ -41,26 +35,23 @@ import org.bread_experts_group.io.reader.BSLReader.Companion.fileReadCheck
 import org.bread_experts_group.io.reader.BSLReader.Companion.socketReadCheck
 import org.bread_experts_group.io.reader.BSLWriter
 import org.bread_experts_group.io.reader.BSLWriter.Companion.socketWriteCheck
-import org.bread_experts_group.project_incubator.rfb.PixelFormatDataStructure.Companion.nextPixelFormatStructure
-import org.bread_experts_group.project_incubator.rfb.PixelFormatDataStructure.Companion.writePixelFormatStructure
+import org.bread_experts_group.rfb.PixelFormatDataStructure.Companion.nextPixelFormatStructure
+import org.bread_experts_group.rfb.PixelFormatDataStructure.Companion.writePixelFormatStructure
 import java.nio.ByteOrder
+import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.zip.InflaterInputStream
-import kotlin.math.abs
-import kotlin.math.floor
-import kotlin.math.roundToInt
 import kotlin.time.Duration
 import kotlin.time.DurationUnit
 import kotlin.time.toDuration
 
-val frames = mutableListOf<ImageFrame>()
-val logQueue = LinkedBlockingQueue<LogMessage>()
+private val logQueue = LinkedBlockingQueue<LogMessage>()
 
 fun client(
 	name: String, addressData: InternetProtocolV6AddressPortData,
-	read: BSLReader<*, *>, write: BSLWriter<*, *>, serverPort: UShort
+	read: BSLReader<*, *>, write: BSLWriter<*, *>, serverPort: UShort,
+	frames: List<ImageFrame>
 ) {
 	fun shutdown(reason: String) {
 		logQueue.add(LogMessage.Disconnect(true, reason, addressData, serverPort))
@@ -245,7 +236,7 @@ fun client(
 fun threadLoop(
 	tcpV6Resolution: IPv6TCPResolutionFeature, tcpV6: SystemInternetProtocolV6TCPFeature,
 	port: UShort, serverName: String,
-	bans: Map<BanMode, List<InternetProtocolV6AddressData>>
+	bans: Map<BanMode, List<InternetProtocolV6AddressData>>, frames: List<ImageFrame>
 ) {
 	val tcpV6RecvAny = tcpV6Resolution.resolve(
 		"", port,
@@ -293,7 +284,7 @@ fun threadLoop(
 			read.order = ByteOrder.BIG_ENDIAN
 			write.order = ByteOrder.BIG_ENDIAN
 			try {
-				client(serverName, acceptedAddress, read, write, port)
+				client(serverName, acceptedAddress, read, write, port, frames)
 			} catch (_: BSLSocketConnectionEnded) {
 				logQueue.add(
 					LogMessage.Disconnect(false, "Client disconnected", acceptedAddress, port)
@@ -325,21 +316,32 @@ fun main(args: Array<String>) {
 
 	val port = Flag(
 		"port",
-		"A port to use for listening on the RFB server.",
+		"A port to use for listening on the RFB server." +
+		"\nFormat: PORT" +
+		"\nFormat: PORT,IMAGE" +
+		"\n\tThe image used by the above format is defined by the default_image flag.",
 		true,
-		default = 5900u,
-		conv = ::portEffector
+		default = 5900u.toUShort() to emptyList(),
+		conv = {
+			val imageSplit = it.split(',', limit = 2)
+			portEffector(imageSplit[0]) to (if (imageSplit.size == 2) decodePNG(imageSplit[1]) else emptyList())
+		}
 	)
 	val portRange = Flag(
 		"port_range",
-		"A range of ports to use for listening on the RFB server.\nFormat: LowerPort-UpperPort",
+		"A range of ports to use for listening on the RFB server." +
+		"\nFormat: LOWERPORT-UPPERPORT" +
+		"\nFormat: LOWERPORT-UPPERPORT,IMAGE" +
+		"\n\tThe image used by the above format is defined by the default_image flag.",
 		true,
 		conv = {
-			val split = it.split('-')
-			if (split.size != 2) throw IllegalArgumentException(
+			val imageSplit = it.split(',', limit = 1)
+			val portSplit = imageSplit[0].split('-')
+			if (portSplit.size != 2) throw IllegalArgumentException(
 				"\"$it\": Port range must consist of a lower and upper bound, like so: \"5900-5910\""
 			)
-			portEffector(split[0])..portEffector(split[1])
+			portEffector(portSplit[0])..portEffector(portSplit[1]) to
+					(if (imageSplit.size == 2) decodePNG(imageSplit[1]) else emptyList())
 		}
 	)
 	val name = Flag(
@@ -348,328 +350,67 @@ fun main(args: Array<String>) {
 		default = "BSLSTD_${bslVersion()}",
 		required = 1
 	)
-	val imagePath = Flag(
-		"image",
-		"The image to transmit over the RFB connection.",
-		required = 1,
-		conv = {
-			val path = SystemProvider.get(SystemFeatures.GET_CURRENT_WORKING_PATH_DEVICE).device
-				.get(SystemDeviceFeatures.PATH_APPEND).append(it)
-			val imgOpenData = path.get(SystemDeviceFeatures.IO_DEVICE).open(
-				FileIOReOpenFeatures.READ,
-				FileIOReOpenFeatures.SHARE_READ
-			)
-			val imgDevice = imgOpenData.firstNotNullOf { d -> d as? IODevice }
-			val imgRead = BSLReader(imgDevice.get(IODeviceFeatures.READ), fileReadCheck)
-			imgRead.order = ByteOrder.BIG_ENDIAN
-			val png = CodingFormatsProvider.get(CodingFormats.PORTABLE_NETWORK_GRAPHICS)
-			val magicData = png.read(imgRead, StandardPNGReadingFeatures.CHECK_MAGIC)
-			if (!magicData.contains(StandardPNGReadingFeatures.CHECK_MAGIC)) throw IllegalArgumentException(
-				"\"$it\": Invalid PNG signature."
-			)
-			val header = png.read(imgRead, StandardPNGReadingFeatures.CHUNK_HEADER)
-				.firstNotNullOfOrNull { c -> c as? PNGChunk.Header }
-			if (header == null) throw IllegalArgumentException(
-				"\"$it\": PNG header missing."
-			)
-			var palette: PNGChunk.Palette? = null
-			var transparency: PNGChunk.Transparency? = null
-			val frameControls = mutableMapOf<Int, PNGChunk.FrameControl>()
-			val frameData = mutableMapOf<Int, PNGChunk>()
-			var lastData: PNGChunk? = null
-			var lastDataIndex = 0
-			while (true) {
-				val pngData = png.read(
-					imgRead,
-					StandardPNGReadingFeatures.CHUNK_GENERIC,
-					StandardPNGReadingFeatures.CHUNK_PALETTE,
-					StandardPNGReadingFeatures.CHUNK_IMAGE_DATA,
-					StandardPNGReadingFeatures.CHUNK_END,
-					StandardPNGReadingFeatures.CHUNK_TRANSPARENCY,
-					StandardPNGReadingFeatures.CHUNK_ANIMATION_CONTROL,
-					StandardPNGReadingFeatures.CHUNK_FRAME_CONTROL,
-					StandardPNGReadingFeatures.CHUNK_FRAME_DATA,
-					header
-				).first { c -> c != header && c is PNGChunk } as PNGChunk
-				if (lastData != null && (pngData.identifier == lastData.identifier)) when (lastData) {
-					is PNGChunk.ImageData -> {
-						val newData = PNGChunk.ImageData(
-							lastData.data + (pngData as PNGChunk.ImageData).data
-						)
-						lastData = newData
-						frameData[0] = newData
-					}
-
-					is PNGChunk.FrameData -> {
-						val newData = PNGChunk.FrameData(
-							lastDataIndex,
-							lastData.data + (pngData as PNGChunk.FrameData).data
-						)
-						lastData = newData
-						frameData[lastDataIndex] = newData
-					}
-				} else when (pngData) {
-					is PNGChunk.ImageData -> {
-						frameData[0] = pngData
-						lastData = pngData
-					}
-
-					is PNGChunk.FrameData -> {
-						frameData[pngData.sequence] = pngData
-						lastDataIndex = pngData.sequence
-						lastData = pngData
-					}
-
-					else -> {
-						lastData = null
-						when (pngData) {
-							is PNGChunk.Palette -> palette = pngData
-							is PNGChunk.Transparency -> transparency = pngData
-							is PNGChunk.FrameControl -> frameControls[pngData.sequence] = pngData
-							is PNGChunk.End -> break
-							is PNGChunk.Generic -> println("BSL developer help: ${pngData.identifier.toHexString()} ?")
-						}
-					}
-				}
-			}
-			frameData.entries.removeIf { (sequence, chunk) ->
-				when (chunk) {
-					is PNGChunk.ImageData if ((sequence !in frameControls) && (frameControls.isNotEmpty())) -> {
-						println("Dropping first frame: no control")
-						true
-					}
-
-					is PNGChunk.FrameData if (sequence - 1 !in frameControls) -> {
-						println("Dropping frame sequence # $sequence: no control")
-						true
-					}
-
-					else -> false
-				}
-			}
-			var argb = IntArray(header.w * header.h)
-			frameData.forEach { (sequence, chunk) ->
-				val control: PNGChunk.FrameControl
-				val data: ByteArray
-				if (chunk is PNGChunk.ImageData) {
-					control = frameControls[sequence] ?: PNGChunk.FrameControl(
-						0,
-						header.w, header.h, 0, 0,
-						Duration.INFINITE,
-						MappedEnumeration(PNGChunk.FrameControl.DisposalOperation.APNG_DISPOSE_OP_NONE),
-						MappedEnumeration(PNGChunk.FrameControl.BlendOperation.APNG_BLEND_OP_SOURCE)
-					)
-					data = chunk.data
-				} else {
-					chunk as PNGChunk.FrameData
-					control = frameControls[sequence - 1]!!
-					data = chunk.data
-				}
-				// Decoding
-				val previousReturn = if (
-					control.disposeOperation.enum == PNGChunk.FrameControl.DisposalOperation.APNG_DISPOSE_OP_PREVIOUS
-				) argb.clone() else argb
-				// TODO StartDEFLATE
-				val inflater = InflaterInputStream(data.inputStream())
-				// TODO EndDEFLATE
-
-				fun paethPredictor(a: Int, b: Int, c: Int): Int {
-					val p = a + b - c
-					val pa = abs(p - a)
-					val pb = abs(p - b)
-					val pc = abs(p - c)
-					return if ((pa <= pb) && (pa <= pc)) a
-					else if (pb <= pc) b
-					else c
-				}
-
-				val colorTypeRaw = header.colorType.raw()
-				val channels = when (colorTypeRaw) {
-					2L -> 3
-					3L -> 1
-					6L -> 4
-					else -> TODO("No decoder: ${header.colorType}")
-				}
-
-				when (header.bitDepth) {
-					8 -> {
-						var lastScanLine = ByteArray(control.w * channels)
-						var thisScanLine = ByteArray(control.w * channels)
-						var y = 0
-						while (y < control.h) {
-							var x = 0
-							val localFilter = inflater.read()
-							var i = 0
-							while (i < lastScanLine.size) {
-								val thisByte = inflater.read()
-								val a = if (i >= channels) thisScanLine[i - channels].toInt() and 0xFF else 0
-								val b = lastScanLine[i].toInt() and 0xFF
-								val c = if (i >= channels) lastScanLine[i - channels].toInt() and 0xFF else 0
-								val decoded = when (localFilter) {
-									0 -> thisByte
-									1 -> thisByte + a
-									2 -> thisByte + b
-									3 -> thisByte + floor((a + b) / 2.0).roundToInt()
-									4 -> thisByte + paethPredictor(a, b, c)
-									else -> TODO("Unknown filter $localFilter")
-								}
-								thisScanLine[i] = (decoded and 0xFF).toByte()
-								i++
-							}
-							fun absolute() = (header.w * (control.y + y)) + (control.x + x)
-							when (colorTypeRaw) {
-								2L -> for (i in 2 until thisScanLine.size step 3) {
-									val r = (thisScanLine[i - 2].toInt() and 0xFF)
-									val g = (thisScanLine[i - 1].toInt() and 0xFF)
-									val b = (thisScanLine[i].toInt() and 0xFF)
-									argb[absolute()] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-									x++
-								}
-
-								3L -> {
-									palette ?: throw IllegalArgumentException(
-										"\"$it\": Missing palette for indexed-color image!"
-									)
-									val transparency = transparency as? PNGChunk.Transparency.Palette
-									for (i in 0 until thisScanLine.size) {
-										val thisColor = thisScanLine[i].toInt() and 0xFF
-										var value = palette.palette[thisColor]
-										if (transparency != null) {
-											val localTransparency = transparency.palette.getOrNull(thisColor)
-											value = value or (if (localTransparency != null)
-												(localTransparency.toInt() and 0xFF) shl 24
-											else (0xFF shl 24))
-										}
-										argb[absolute()] = when (control.blendOperation.enum) {
-											PNGChunk.FrameControl.BlendOperation.APNG_BLEND_OP_SOURCE -> value
-											PNGChunk.FrameControl.BlendOperation.APNG_BLEND_OP_OVER -> {
-												val sourceAlpha = value ushr 24
-												if (sourceAlpha == 0xFF) value
-												else {
-													val dest = argb[absolute()]
-													// TODO ALPHA BLEND
-//													val destAlpha = dest ushr 24
-													dest
-												}
-											}
-
-											else -> {
-												println("Warning! blend ? ${control.blendOperation}")
-												value
-											}
-										}
-										x++
-									}
-								}
-
-								6L -> for (i in 3 until thisScanLine.size step 4) {
-									val r = (thisScanLine[i - 3].toInt() and 0xFF)
-									val g = (thisScanLine[i - 2].toInt() and 0xFF)
-									val b = (thisScanLine[i - 1].toInt() and 0xFF)
-									val a = (thisScanLine[i].toInt() and 0xFF)
-									argb[absolute()] = (a shl 24) or (r shl 16) or (g shl 8) or b
-									x++
-								}
-
-								else -> TODO("No decoder: ${header.colorType}")
-							}
-							val temp = lastScanLine
-							lastScanLine = thisScanLine
-							thisScanLine = temp
-							y++
-						}
-					}
-
-					16 -> {
-						val bytesPerPixel = channels * 2
-						var lastScanLine = ByteArray(control.w * bytesPerPixel)
-						var thisScanLine = ByteArray(control.w * bytesPerPixel)
-						var y = 0
-						var pixel = 0
-						while (y < control.h) {
-							val localFilter = inflater.read()
-							var i = 0
-							while (i < lastScanLine.size) {
-								val thisByte = inflater.read()
-								val a = if (i >= bytesPerPixel) thisScanLine[i - bytesPerPixel].toInt() and 0xFF else 0
-								val b = lastScanLine[i].toInt() and 0xFF
-								val c = if (i >= bytesPerPixel) lastScanLine[i - bytesPerPixel].toInt() and 0xFF else 0
-								val decoded = when (localFilter) {
-									0 -> thisByte
-									1 -> thisByte + a
-									2 -> thisByte + b
-									4 -> thisByte + paethPredictor(a, b, c)
-									else -> TODO("Unknown filter $localFilter")
-								}
-								thisScanLine[i] = (decoded and 0xFF).toByte()
-								i++
-							}
-							when (colorTypeRaw) {
-								2L -> for (i in 5 until thisScanLine.size step 6) {
-									val r = ((thisScanLine[i - 5].toInt() and 0xFF) shl 8) or
-											(thisScanLine[i - 4].toInt() and 0xFF)
-									val g = ((thisScanLine[i - 3].toInt() and 0xFF) shl 8) or
-											(thisScanLine[i - 2].toInt() and 0xFF)
-									val b = ((thisScanLine[i - 1].toInt() and 0xFF) shl 8) or
-											(thisScanLine[i].toInt() and 0xFF)
-									argb[pixel++] = (0xFF shl 24) or
-											(((r / 65535.0) * 255).roundToInt() shl 16) or
-											(((g / 65535.0) * 255).roundToInt() shl 8) or
-											((b / 65535.0) * 255).roundToInt()
-								}
-
-								6L -> for (i in 7 until thisScanLine.size step 8) {
-									val r = ((thisScanLine[i - 7].toInt() and 0xFF) shl 8) or
-											(thisScanLine[i - 6].toInt() and 0xFF)
-									val g = ((thisScanLine[i - 5].toInt() and 0xFF) shl 8) or
-											(thisScanLine[i - 4].toInt() and 0xFF)
-									val b = ((thisScanLine[i - 3].toInt() and 0xFF) shl 8) or
-											(thisScanLine[i - 2].toInt() and 0xFF)
-									val a = ((thisScanLine[i - 1].toInt() and 0xFF) shl 8) or
-											(thisScanLine[i].toInt() and 0xFF)
-									argb[pixel++] = (((a / 65535.0) * 255).roundToInt() shl 24) or
-											(((r / 65535.0) * 255).roundToInt() shl 16) or
-											(((g / 65535.0) * 255).roundToInt() shl 8) or
-											((b / 65535.0) * 255).roundToInt()
-								}
-
-								else -> TODO("No decoder: ${header.colorType}")
-							}
-							val temp = lastScanLine
-							lastScanLine = thisScanLine
-							thisScanLine = temp
-							y++
-						}
-					}
-
-					else -> TODO("${header.bitDepth}-bit")
-				}
-				// End
-				inflater.close()
-				frames.add(
-					ImageFrame(
-						0, 0,
-						header.w, header.h,
-						argb.clone(), control.delay
-					)
-				)
-				when (control.disposeOperation.enum) {
-					PNGChunk.FrameControl.DisposalOperation.APNG_DISPOSE_OP_NONE -> {}
-					PNGChunk.FrameControl.DisposalOperation.APNG_DISPOSE_OP_BACKGROUND -> {
-						for (i in argb.indices) argb[i] = 0
-					}
-
-					PNGChunk.FrameControl.DisposalOperation.APNG_DISPOSE_OP_PREVIOUS -> argb = previousReturn
-					else -> println("Warning! disposal ? ${control.disposeOperation}")
-				}
-			}
-			imgDevice.get(IODeviceFeatures.RELEASE)
-			true
-		}
+	val defaultImagePath = Flag(
+		"default_image",
+		"The image to transmit over the RFB connection." +
+		"\nThis flag is used when the port / port_range flags do not have a set image.",
+		conv = ::decodePNG
 	)
-	val logTemplate = Flag<String>(
+	val logTemplate = Flag(
 		"log_template",
-		"The name template to use for logging user actions."
+		"The name template to use for logging user actions." +
+		"\nExample Templates:" +
+		"\n\texample.log" +
+		"\n\tVNC_{datetime:yyyy-MM-dd}.log" +
+		"\nSupported Templates:" +
+		"\n\tdatetime: See https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/time/format/DateTimeFormatter.html" +
+		"\nTemplates are used in names with the following format:" +
+		"\n\t{TEMPLATE[:TEMPLATE PARAMETER]}" +
+		"\n\tWhere the file system allows, you can use \\ to escape the {}, or \\ itself.",
+		conv = { template ->
+			{
+				var string = ""
+				var templateName = ""
+				var templateParameter = ""
+				var escaping = false
+				var inTemplate = false
+				var inTemplateName = false
+				for (char in template) if (!inTemplate) {
+					if (escaping) {
+						escaping = false
+						string += char
+						continue
+					}
+					when (char) {
+						'\\' -> escaping = true
+						'{' -> {
+							inTemplate = true
+							inTemplateName = true
+						}
+						else -> string += char
+					}
+				} else when (char) {
+					'}' -> {
+						inTemplate = false
+						inTemplateName = false
+						when (templateName.lowercase()) {
+							"datetime" -> {
+								val formatter = DateTimeFormatter.ofPattern(templateParameter)
+								string += ZonedDateTime.now().format(formatter)
+							}
+
+							else -> throw IllegalArgumentException("\"$template\": Unsupported template: $templateName")
+						}
+						templateName = ""
+						templateParameter = ""
+					}
+
+					':' -> inTemplateName = false
+					else -> if (inTemplateName) templateName += char else templateParameter += char
+				}
+				string
+			}
+		}
 	)
 	val logConnectionEvents = Flag(
 		"log_connections",
@@ -835,15 +576,22 @@ fun main(args: Array<String>) {
 		args,
 		"RFB Projection & Client Logging",
 		"Projects an image onto a minimal RFB server, with the ability to log client messages.",
-		port, portRange, name, imagePath,
+		port, portRange, name, defaultImagePath,
 		logTemplate, logConnectionEvents, logKeyEvents, logMouseButtonEvents,
 		logMouseMovementEvents, logClipboardEvents, logInfoEvents,
 		ban, banFile, maxSessionTime, maxInactivityTime
 	)
 	val serverName = args.getRequired(name)
-	val ports = mutableSetOf<UShort>()
-	ports.addAll(args.getsRequired(port))
-	ports.addAll(args.gets(portRange)?.flatMap { it.map { ui -> ui.toUShort() } } ?: emptyList())
+	val ports = mutableMapOf<UShort, MutableList<ImageFrame>>()
+	args.getsRequired(port).forEach { (port, frames) ->
+		ports.getOrPut(port) { mutableListOf() }.addAll(frames)
+	}
+	args.gets(portRange)?.forEach { (portRange, frames) ->
+		portRange.forEach { port ->
+			ports.getOrPut(port.toUShort()) { mutableListOf() }.addAll(frames)
+		}
+	}
+	val default = args.get(defaultImagePath)
 	val bans = mutableMapOf<BanMode, MutableList<InternetProtocolV6AddressData>>()
 	val bansUnmerged = mutableSetOf<Pair<BanMode, InternetProtocolV6AddressData>>()
 	bansUnmerged.addAll(args.gets(ban) ?: emptyList())
@@ -851,15 +599,20 @@ fun main(args: Array<String>) {
 	bansUnmerged.forEach { (mode, address) ->
 		bans.getOrPut(mode) { mutableListOf() }.add(address)
 	}
-	ports.forEach {
-		Thread.ofPlatform().name("Thread Loop [$it]").start {
+	ports.forEach { (port, frames) ->
+		Thread.ofPlatform().name("Thread Loop [$port; ${frames.size} frame(s)]").start {
 			threadLoop(
 				tcpV6Resolution, tcpV6,
-				it, serverName,
-				bans
+				port, serverName,
+				bans, frames.ifEmpty {
+					default ?: throw IllegalArgumentException(
+						"You must specify the default_image flag; port $port is missing an image."
+					)
+				}
 			)
 		}
 	}
+	val logTemplater = args.get(logTemplate) ?: return
 	val connectOK = args.getRequired(logConnectionEvents)
 	val mouseButtonOK = args.getRequired(logMouseButtonEvents)
 	val mouseMouseOK = args.getRequired(logMouseMovementEvents)
@@ -867,18 +620,32 @@ fun main(args: Array<String>) {
 	val clipboardOK = args.getRequired(logClipboardEvents)
 	val infoOK = args.getRequired(logInfoEvents)
 	Thread.ofPlatform().name("Log Queue Manager").start {
-		val openData = SystemProvider.get(SystemFeatures.GET_CURRENT_WORKING_PATH_DEVICE).device
-			.get(SystemDeviceFeatures.PATH_APPEND).append("test.log")
-			.get(SystemDeviceFeatures.IO_DEVICE).open(
-				FileIOReOpenFeatures.WRITE,
-				FileIOReOpenFeatures.SHARE_READ,
-				StandardIOOpenFeatures.CREATE
+		var openTemplate: String? = null
+		var openWriter: BSLWriter<*, *>? = null
+		var openDevice: IODevice? = null
+
+		@Suppress("AssignedValueIsNeverRead")
+		fun writer(): BSLWriter<*, *> {
+			val template = logTemplater()
+			if (template == openTemplate) return openWriter!!
+			openTemplate = template
+			openDevice?.get(IODeviceFeatures.RELEASE)?.close()
+			val openData = SystemProvider.get(SystemFeatures.GET_CURRENT_WORKING_PATH_DEVICE).device
+				.get(SystemDeviceFeatures.PATH_APPEND).append(template)
+				.get(SystemDeviceFeatures.IO_DEVICE).open(
+					FileIOReOpenFeatures.WRITE,
+					FileIOReOpenFeatures.SHARE_READ,
+					StandardIOOpenFeatures.CREATE
+				)
+			val logDevice = openData.firstNotNullOfOrNull { it as? IODevice }
+			if (logDevice == null) throw IllegalStateException(
+				"Failed to open log for writing. Status: $openData"
 			)
-		val logDevice = openData.firstNotNullOfOrNull { it as? IODevice }
-		if (logDevice == null) throw IllegalStateException(
-			"Failed to open log for writing. Status: $openData"
-		)
-		val write = BSLWriter(logDevice.get(IODeviceFeatures.WRITE), { _, _ -> })
+			openDevice = logDevice
+			val writer = BSLWriter(logDevice.get(IODeviceFeatures.WRITE), { _, _ -> })
+			openWriter = writer
+			return writer
+		}
 		val formatter = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss.SSSxxxx")
 		var lastMouseMask = 0
 		while (true) {
@@ -886,8 +653,8 @@ fun main(args: Array<String>) {
 			fun writeLine(contents: String) {
 				val then = nextLog.at.format(formatter)
 				val label = "($serverName [${nextLog.managingPort}]) ${nextLog.address} @ $then : $contents\n"
-				write.write(label.toByteArray(Charsets.UTF_8))
-				write.flush()
+				writer().write(label.toByteArray(Charsets.UTF_8))
+				writer().flush()
 			}
 
 			when (nextLog) {

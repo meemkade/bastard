@@ -1,4 +1,4 @@
-package org.bread_experts_group.project_incubator.rfb
+package org.bread_experts_group.rfb
 
 import kotlin.time.Duration
 
